@@ -98,8 +98,12 @@ import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
 import {
   applyToolResultBudget,
+  measureContentReplacementState,
+  measureToolUseResultRetention,
   scrubAgedToolUseResults,
+  trimContentReplacementState,
 } from './utils/toolResultStorage.js'
+import { emitTurnSnapshot, parseEnvCRSCap, parseEnvKeepRecent } from './utils/memDebug.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import { buildQueryConfig } from './query/config.js'
@@ -438,15 +442,35 @@ async function* queryLoop(
     // brings the main REPL to the same memory profile. Keeps `keepRecent`
     // most recent payloads so transcript scrollback/turn diffs/search keep
     // working for recent turns. Override with OPENCLAUDE_KEEP_RECENT_TOOL_RESULTS.
-    const keepRecentToolResults = (() => {
-      const raw = process.env.OPENCLAUDE_KEEP_RECENT_TOOL_RESULTS
-      const parsed = raw === undefined ? NaN : Number.parseInt(raw, 10)
-      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 100
-    })()
+    const keepRecentToolResults = parseEnvKeepRecent()
+    const retentionBefore = measureToolUseResultRetention(messagesForQuery)
     messagesForQuery = scrubAgedToolUseResults(
       messagesForQuery,
       keepRecentToolResults,
     )
+    const retentionAfter = measureToolUseResultRetention(messagesForQuery)
+    const scrubbedThisTurn =
+      retentionBefore.withToolUseResult - retentionAfter.withToolUseResult
+
+    // Bound ContentReplacementState (seenIds + replacements maps grow
+    // monotonically across a long session — secondary leak path identified
+    // alongside #546 fix). LRU by insertion order; correctness untouched
+    // because stale UUID entries are inert outside the live message window.
+    const crsCap = parseEnvCRSCap()
+    const evictedThisTurn = trimContentReplacementState(
+      toolUseContext.contentReplacementState,
+      crsCap,
+    )
+
+    // Emit diagnostic snapshot so the next OOM tells us where memory went.
+    emitTurnSnapshot({
+      retention: retentionAfter,
+      crs: measureContentReplacementState(
+        toolUseContext.contentReplacementState,
+      ),
+      scrubbed: scrubbedThisTurn,
+      evicted: evictedThisTurn,
+    })
 
     // Apply snip before microcompact (both may run — they are not mutually exclusive).
     // snipTokensFreed is plumbed to autocompact so its threshold check reflects

@@ -800,6 +800,131 @@ export function scrubAgedToolUseResults(
   })
 }
 
+/**
+ * Rough byte cost of a `toolUseResult` payload. We don't need exactness —
+ * just a relative signal of which retained payloads dominate memory.
+ * Uses JSON.stringify length where possible, falling back to a constant
+ * sentinel for circular/non-serializable values.
+ */
+function approxToolUseResultBytes(v: unknown): number {
+  if (v === undefined || v === null) return 0
+  if (typeof v === 'string') return v.length
+  try {
+    return JSON.stringify(v).length
+  } catch {
+    return 256
+  }
+}
+
+type ToolUseResultRetention = {
+  totalMessages: number
+  userMessages: number
+  withToolUseResult: number
+  approxBytes: number
+  topPayloads: Array<{ index: number; size: number; toolUseId?: string }>
+}
+
+/**
+ * Cheap snapshot of how much memory toolUseResult retention is consuming.
+ * Walks the Message[] once. Designed to be safe to call every turn.
+ * `topN` defaults to 3 — we just want the worst offenders, not a full list.
+ */
+export function measureToolUseResultRetention(
+  messages: Message[],
+  topN = 3,
+): ToolUseResultRetention {
+  let userMessages = 0
+  let withToolUseResult = 0
+  let approxBytes = 0
+  const top: Array<{ index: number; size: number; toolUseId?: string }> = []
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (m?.type !== 'user') continue
+    userMessages++
+    if (m.toolUseResult === undefined) continue
+    withToolUseResult++
+    const size = approxToolUseResultBytes(m.toolUseResult)
+    approxBytes += size
+    if (top.length < topN) {
+      const content = Array.isArray(m.message.content) ? m.message.content : []
+      const tr = content.find(b => b && (b as { type?: string }).type === 'tool_result') as
+        | { tool_use_id?: string }
+        | undefined
+      top.push({ index: i, size, toolUseId: tr?.tool_use_id })
+      top.sort((a, b) => b.size - a.size)
+    } else if (size > top[top.length - 1]!.size) {
+      const content = Array.isArray(m.message.content) ? m.message.content : []
+      const tr = content.find(b => b && (b as { type?: string }).type === 'tool_result') as
+        | { tool_use_id?: string }
+        | undefined
+      top[top.length - 1] = { index: i, size, toolUseId: tr?.tool_use_id }
+      top.sort((a, b) => b.size - a.size)
+    }
+  }
+  return {
+    totalMessages: messages.length,
+    userMessages,
+    withToolUseResult,
+    approxBytes,
+    topPayloads: top,
+  }
+}
+
+type ContentReplacementStateStats = {
+  seenIds: number
+  replacements: number
+  approxReplacementBytes: number
+}
+
+export function measureContentReplacementState(
+  state: ContentReplacementState | undefined,
+): ContentReplacementStateStats {
+  if (!state) return { seenIds: 0, replacements: 0, approxReplacementBytes: 0 }
+  let bytes = 0
+  for (const v of state.replacements.values()) bytes += v.length
+  return {
+    seenIds: state.seenIds.size,
+    replacements: state.replacements.size,
+    approxReplacementBytes: bytes,
+  }
+}
+
+/**
+ * Bound the ContentReplacementState to prevent monotonic growth across a
+ * long session. Set/Map iteration order is insertion order, so evicting the
+ * "oldest" key is just deleting the first iterated key. We trim until both
+ * structures are at-or-below `max`.
+ *
+ * Correctness: per the docstring on ContentReplacementState, stale entries
+ * are looked up only by tool_use_id (UUID); evicting an old id only causes
+ * that result to be re-evaluated as "fresh" if it later reappears in the
+ * messages window. In practice older results are well outside that window
+ * by the time we evict. The docstring already accepts that stale entries
+ * are inert — eviction has no correctness cost in the live window.
+ */
+export function trimContentReplacementState(
+  state: ContentReplacementState | undefined,
+  max: number,
+): number {
+  if (!state || max < 0) return 0
+  let evicted = 0
+  while (state.seenIds.size > max) {
+    const first = state.seenIds.values().next().value
+    if (first === undefined) break
+    state.seenIds.delete(first)
+    state.replacements.delete(first)
+    evicted++
+  }
+  while (state.replacements.size > max) {
+    const first = state.replacements.keys().next().value
+    if (first === undefined) break
+    state.replacements.delete(first)
+    state.seenIds.delete(first)
+    evicted++
+  }
+  return evicted
+}
+
 async function buildReplacement(
   candidate: ToolResultCandidate,
 ): Promise<{ content: string; originalSize: number } | null> {
