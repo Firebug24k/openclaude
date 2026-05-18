@@ -96,7 +96,10 @@ import type { QuerySource } from './constants/querySource.js'
 import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js'
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
-import { applyToolResultBudget } from './utils/toolResultStorage.js'
+import {
+  applyToolResultBudget,
+  scrubAgedToolUseResults,
+} from './utils/toolResultStorage.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import { buildQueryConfig } from './query/config.js'
@@ -423,6 +426,27 @@ async function* queryLoop(
         toolUseContext.contentReplacementState?.replacements ?? new Map(),
       )
     }
+
+    // Drop the structured `toolUseResult` payload from aged user messages on
+    // the main REPL. Fixes #546 (V8 heap OOM in long continuous sessions):
+    // applyToolResultBudget only persists tool results that exceed their per-
+    // tool threshold or the per-message aggregate budget, so for Read
+    // (Infinity threshold) and any other tool whose result fits under budget,
+    // the structured `toolUseResult` retained on the parent UserMessage was
+    // never cleared. Over thousands of tool calls this accumulates to GBs.
+    // Subagents already drop toolUseResult at the addToolResult site; this
+    // brings the main REPL to the same memory profile. Keeps `keepRecent`
+    // most recent payloads so transcript scrollback/turn diffs/search keep
+    // working for recent turns. Override with OPENCLAUDE_KEEP_RECENT_TOOL_RESULTS.
+    const keepRecentToolResults = (() => {
+      const raw = process.env.OPENCLAUDE_KEEP_RECENT_TOOL_RESULTS
+      const parsed = raw === undefined ? NaN : Number.parseInt(raw, 10)
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 100
+    })()
+    messagesForQuery = scrubAgedToolUseResults(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
 
     // Apply snip before microcompact (both may run — they are not mutually exclusive).
     // snipTokensFreed is plumbed to autocompact so its threshold check reflects

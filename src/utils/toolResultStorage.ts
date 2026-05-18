@@ -750,6 +750,56 @@ export function applyToolResultReplacementsToMessages(
   return replaceToolResultContents(messages, replacements)
 }
 
+/**
+ * Drop the structured `toolUseResult` payload from aged user messages.
+ *
+ * Background: `addToolResult` (toolExecution.ts) stores the full raw result
+ * object on the parent UserMessage so UI consumers (transcript scrollback,
+ * turn diffs, transcript search, collapsed read/search rendering) can re-
+ * inspect it. The on-disk JSONL transcript also carries it, so resume keeps
+ * working. The problem is that the **in-memory** transcript retains every
+ * tool result forever — for tools whose persistence threshold is Infinity
+ * (Read), or whose per-tool result is under threshold (most Greps/Bashes
+ * under 30K-50K), it is never cleared. A long continuous session (1000s of
+ * tool calls reading model-training files) leaks GBs of strings and V8 OOMs.
+ *
+ * This scrubber runs once per turn and keeps the structured payload only on
+ * the `keepRecent` most recent user messages that have one — old payloads
+ * are nulled out. The wire-bound `tool_result` content blocks are untouched
+ * (the model still sees what the prior turn saw), and disk persistence
+ * already wrote the full payload before this runs. UI consumers gracefully
+ * fall back to the content block when `toolUseResult` is undefined.
+ *
+ * Subagents are unaffected because their `addToolResult` site already drops
+ * `toolUseResult` (toolExecution.ts:1493). This change brings the main REPL
+ * to the same memory profile, just with a generous keep-recent window so
+ * recent UI scrollback is unchanged.
+ */
+export function scrubAgedToolUseResults(
+  messages: Message[],
+  keepRecent: number,
+): Message[] {
+  if (keepRecent < 0 || messages.length === 0) return messages
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.type !== 'user' || m.toolUseResult === undefined) continue
+    if (kept < keepRecent) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) return messages
+  return messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (m.type !== 'user' || m.toolUseResult === undefined) return m
+    return { ...m, toolUseResult: undefined }
+  })
+}
+
 async function buildReplacement(
   candidate: ToolResultCandidate,
 ): Promise<{ content: string; originalSize: number } | null> {
