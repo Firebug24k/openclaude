@@ -103,7 +103,12 @@ import {
   scrubAgedToolUseResults,
   trimContentReplacementState,
 } from './utils/toolResultStorage.js'
-import { emitTurnSnapshot, parseEnvCRSCap, parseEnvKeepRecent } from './utils/memDebug.js'
+import {
+  emitProbe,
+  emitTurnSnapshot,
+  parseEnvCRSCap,
+  parseEnvKeepRecent,
+} from './utils/memDebug.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import { buildQueryConfig } from './query/config.js'
@@ -471,6 +476,33 @@ async function* queryLoop(
       scrubbed: scrubbedThisTurn,
       evicted: evictedThisTurn,
     })
+
+    // Targeted size probe: the turn snapshot's retention covers
+    // toolUseResult only. The actual wire-bound `messagesForQuery` array
+    // (with all content blocks, system blocks, tool definitions, etc.) is
+    // separate and may dominate heap for long sessions. This probe fires
+    // only on heap-threshold crossings — cheap when steady, loud when
+    // climbing. Approx the JSON-serialized size as a proxy for retained
+    // string bytes (V8 doesn't dedupe so this overestimates only for
+    // shared-prefix strings, which is fine for diagnostics).
+    try {
+      let approxMessagesBytes = 0
+      let contentBlockCount = 0
+      for (const m of messagesForQuery) {
+        // Only stringify the .message field — that's the wire body.
+        // Skip rendering the full Message wrapper to keep probe cheap.
+        approxMessagesBytes += JSON.stringify(m.message ?? '').length
+        const content = (m.message as { content?: unknown })?.content
+        if (Array.isArray(content)) contentBlockCount += content.length
+      }
+      emitProbe('query_pre_api', {
+        messagesForQueryLen: messagesForQuery.length,
+        approxMessagesBytes,
+        contentBlockCount,
+      })
+    } catch {
+      /* swallow */
+    }
 
     // Apply snip before microcompact (both may run — they are not mutually exclusive).
     // snipTokensFreed is plumbed to autocompact so its threshold check reflects

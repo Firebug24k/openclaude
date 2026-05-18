@@ -23,10 +23,14 @@ import { homedir } from 'os'
 import { join } from 'path'
 
 const HEAP_THRESHOLDS_BYTES = [
-  500 * 1024 * 1024,
+  256 * 1024 * 1024,
+  384 * 1024 * 1024,
+  512 * 1024 * 1024,
+  768 * 1024 * 1024,
   1024 * 1024 * 1024,
-  2 * 1024 * 1024 * 1024,
-  3 * 1024 * 1024 * 1024,
+  1536 * 1024 * 1024,
+  2048 * 1024 * 1024,
+  3072 * 1024 * 1024,
 ]
 
 const STATE = {
@@ -35,6 +39,7 @@ const STATE = {
   every: 25,
   turn: 0,
   lastThresholdIdx: -1,
+  firstProbeSent: false,
   startedAt: 0,
   logFile: '',
 }
@@ -48,7 +53,7 @@ function init() {
     process.env.OPENCLAUDE_MEM_DEBUG_EVERY ?? '',
     10,
   )
-  STATE.every = Number.isFinite(every) && every > 0 ? every : 25
+  STATE.every = Number.isFinite(every) && every > 0 ? every : 1
   STATE.startedAt = Date.now()
   try {
     const dir = join(homedir(), '.openclaude')
@@ -158,5 +163,56 @@ export function emitTurnSnapshot(snap: MemDebugSnapshot) {
     crs: snap.crs,
     scrubbedThisTurn: snap.scrubbed,
     crsEvictedThisTurn: snap.evicted,
+  })
+}
+
+/**
+ * Intra-turn probe — called from hotspots that may allocate large amounts
+ * mid-turn (tool execution, API stream completion, message normalization).
+ * Logs only when heap crosses a new threshold, so cheap to leave wired in.
+ *
+ * Why this exists: fix546.2's turn-boundary probe missed the climb on
+ * disko because the heap went from 420 MB at turn 5 directly to OOM before
+ * the next turn boundary. Single tool calls (giant Reads, big API streams)
+ * can blow the heap inside a turn. We need to catch that within-turn delta.
+ */
+export function emitProbe(
+  label: string,
+  extras?: Record<string, unknown>,
+): void {
+  init()
+  if (!STATE.enabled) return
+  const mu = process.memoryUsage()
+  // Probes only emit on heap-threshold crossings — they're called from hot
+  // loops so per-tool emit would be noise. Threshold table is cumulative
+  // across turn+probe emits via shouldEmit's lastThresholdIdx.
+  let fire = false
+  for (let i = HEAP_THRESHOLDS_BYTES.length - 1; i >= 0; i--) {
+    if (mu.heapUsed >= HEAP_THRESHOLDS_BYTES[i]! && STATE.lastThresholdIdx < i) {
+      STATE.lastThresholdIdx = i
+      fire = true
+      break
+    }
+  }
+  // Always fire on the first probe of a session (validates the wiring).
+  if (!STATE.firstProbeSent) {
+    STATE.firstProbeSent = true
+    fire = true
+  }
+  if (!fire) return
+  writeRecord({
+    event: 'memdebug_probe',
+    ts: new Date().toISOString(),
+    label,
+    turn: STATE.turn,
+    uptimeSec: Math.round((Date.now() - STATE.startedAt) / 1000),
+    mem: {
+      rss: mu.rss,
+      heapTotal: mu.heapTotal,
+      heapUsed: mu.heapUsed,
+      external: mu.external,
+      arrayBuffers: mu.arrayBuffers,
+    },
+    ...(extras ?? {}),
   })
 }
