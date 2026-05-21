@@ -799,6 +799,100 @@ export function scrubAgedToolUseResults(
     return { ...m, toolUseResult: undefined }
   })
 }
+/**
+ * Sibling of scrubAgedToolUseResults — replaces the in-memory wire-bound
+ * tool_result content strings on aged user messages with a short placeholder.
+ *
+ * Why this is safe:
+ *  - The JSONL transcript already wrote the original content to disk before
+ *    this runs, so `/resume` and post-mortem read the originals.
+ *  - The API call only sends the most recent ~keepRecent turns anyway
+ *    (microCompact + provider truncation), so replaced strings on older
+ *    messages were not going on the wire.
+ *  - `applyToolResultBudget` already replaces large results with CRS UUIDs
+ *    when over budget — this fills the gap for results that stayed under
+ *    budget but persisted on the heap.
+ *
+ * Threshold: only strings > 2 KB are replaced (small Bash returns and
+ * status pings stay legible in scrollback).
+ */
+export function scrubAgedToolResultContent(
+  messages: Message[],
+  keepRecent: number,
+  minSizeBytes = 2048,
+): { messages: Message[]; replacedCount: number; replacedBytes: number } {
+  if (keepRecent < 0 || messages.length === 0) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+  // Find the index of the keepRecent-th user-with-tool_result from the end.
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.type !== 'user') continue
+    const content = Array.isArray(m.message.content) ? m.message.content : []
+    const hasToolResult = content.some(
+      b => b && (b as { type?: string }).type === 'tool_result',
+    )
+    if (!hasToolResult) continue
+    if (kept < keepRecent) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) return { messages, replacedCount: 0, replacedBytes: 0 }
+
+  let replacedCount = 0
+  let replacedBytes = 0
+  const out = messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (m?.type !== 'user') return m
+    const content = Array.isArray(m.message.content) ? m.message.content : null
+    if (!content) return m
+    let touched = false
+    const newContent = content.map(b => {
+      const block = b as { type?: string; content?: unknown; tool_use_id?: string }
+      if (block?.type !== 'tool_result') return b
+      const c = block.content
+      // content can be string OR Array<{type:'text'|'image', text?, source?}>
+      if (typeof c === 'string') {
+        if (c.length < minSizeBytes) return b
+        replacedCount++
+        replacedBytes += c.length
+        touched = true
+        return { ...block, content: '[older tool result truncated for memory]' }
+      }
+      if (Array.isArray(c)) {
+        let arrTouched = false
+        const newArr = c.map(part => {
+          const p = part as { type?: string; text?: string; source?: { data?: string } }
+          if (p?.type === 'text' && typeof p.text === 'string' && p.text.length >= minSizeBytes) {
+            replacedCount++
+            replacedBytes += p.text.length
+            arrTouched = true
+            return { ...p, text: '[older tool result truncated for memory]' }
+          }
+          if (p?.type === 'image' && p.source && typeof p.source.data === 'string'
+              && p.source.data.length >= minSizeBytes) {
+            replacedCount++
+            replacedBytes += p.source.data.length
+            arrTouched = true
+            return { type: 'text', text: '[older image truncated for memory]' }
+          }
+          return part
+        })
+        if (arrTouched) { touched = true; return { ...block, content: newArr } }
+        return b
+      }
+      return b
+    })
+    return touched ? { ...m, message: { ...m.message, content: newContent } } : m
+  })
+  return { messages: out, replacedCount, replacedBytes }
+}
+
 
 /**
  * Rough byte cost of a `toolUseResult` payload. We don't need exactness —

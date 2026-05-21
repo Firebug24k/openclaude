@@ -39,6 +39,7 @@ const STATE = {
   every: 25,
   turn: 0,
   lastThresholdIdx: -1,
+  probeLastThresholdIdx: -1,
   firstProbeSent: false,
   startedAt: 0,
   logFile: '',
@@ -139,6 +140,8 @@ export type MemDebugSnapshot = {
   crs: { seenIds: number; replacements: number; approxReplacementBytes: number }
   scrubbed: number // newly-scrubbed messages this turn
   evicted: number // newly-evicted CRS entries this turn
+  contentScrubbed?: number
+  contentScrubbedBytes?: number
 }
 
 export function emitTurnSnapshot(snap: MemDebugSnapshot) {
@@ -163,6 +166,8 @@ export function emitTurnSnapshot(snap: MemDebugSnapshot) {
     crs: snap.crs,
     scrubbedThisTurn: snap.scrubbed,
     crsEvictedThisTurn: snap.evicted,
+    contentScrubbedThisTurn: snap.contentScrubbed ?? 0,
+    contentScrubbedBytes: snap.contentScrubbedBytes ?? 0,
   })
 }
 
@@ -188,8 +193,8 @@ export function emitProbe(
   // across turn+probe emits via shouldEmit's lastThresholdIdx.
   let fire = false
   for (let i = HEAP_THRESHOLDS_BYTES.length - 1; i >= 0; i--) {
-    if (mu.heapUsed >= HEAP_THRESHOLDS_BYTES[i]! && STATE.lastThresholdIdx < i) {
-      STATE.lastThresholdIdx = i
+    if (mu.heapUsed >= HEAP_THRESHOLDS_BYTES[i]! && STATE.probeLastThresholdIdx < i) {
+      STATE.probeLastThresholdIdx = i
       fire = true
       break
     }

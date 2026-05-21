@@ -101,6 +101,7 @@ import {
   measureContentReplacementState,
   measureToolUseResultRetention,
   scrubAgedToolUseResults,
+  scrubAgedToolResultContent,
   trimContentReplacementState,
 } from './utils/toolResultStorage.js'
 import {
@@ -457,6 +458,15 @@ async function* queryLoop(
     const scrubbedThisTurn =
       retentionBefore.withToolUseResult - retentionAfter.withToolUseResult
 
+    // fix546.5: also strip aged tool_result.content strings, not just the
+    // structured toolUseResult sibling. Closes the linear growth path that
+    // was still active in the fix546.4 trace (state.messages content blocks).
+    const contentScrub = scrubAgedToolResultContent(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
+    messagesForQuery = contentScrub.messages
+
     // Bound ContentReplacementState (seenIds + replacements maps grow
     // monotonically across a long session — secondary leak path identified
     // alongside #546 fix). LRU by insertion order; correctness untouched
@@ -475,6 +485,8 @@ async function* queryLoop(
       ),
       scrubbed: scrubbedThisTurn,
       evicted: evictedThisTurn,
+      contentScrubbed: contentScrub.replacedCount,
+      contentScrubbedBytes: contentScrub.replacedBytes,
     })
 
     // Targeted size probe: the turn snapshot's retention covers
