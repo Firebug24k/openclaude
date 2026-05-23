@@ -96,7 +96,22 @@ import type { QuerySource } from './constants/querySource.js'
 import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js'
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
-import { applyToolResultBudget } from './utils/toolResultStorage.js'
+import {
+  applyToolResultBudget,
+  measureContentReplacementState,
+  measureToolUseResultRetention,
+  scrubAgedToolUseResults,
+  scrubAgedToolResultContent,
+  scrubAgedImages,
+  scrubAgedHookAttachments,
+  trimContentReplacementState,
+} from './utils/toolResultStorage.js'
+import {
+  emitProbe,
+  emitTurnSnapshot,
+  parseEnvCRSCap,
+  parseEnvKeepRecent,
+} from './utils/memDebug.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import {
@@ -427,6 +442,125 @@ async function* queryLoop(
       toolUseContext.syncToolResultReplacements?.(
         toolUseContext.contentReplacementState?.replacements ?? new Map(),
       )
+    }
+
+    // Drop the structured `toolUseResult` payload from aged user messages on
+    // the main REPL. Fixes #546 (V8 heap OOM in long continuous sessions):
+    // applyToolResultBudget only persists tool results that exceed their per-
+    // tool threshold or the per-message aggregate budget, so for Read
+    // (Infinity threshold) and any other tool whose result fits under budget,
+    // the structured `toolUseResult` retained on the parent UserMessage was
+    // never cleared. Over thousands of tool calls this accumulates to GBs.
+    // Subagents already drop toolUseResult at the addToolResult site; this
+    // brings the main REPL to the same memory profile. Keeps `keepRecent`
+    // most recent payloads so transcript scrollback/turn diffs/search keep
+    // working for recent turns. Override with OPENCLAUDE_KEEP_RECENT_TOOL_RESULTS.
+    const keepRecentToolResults = parseEnvKeepRecent()
+    const retentionBefore = measureToolUseResultRetention(messagesForQuery)
+    messagesForQuery = scrubAgedToolUseResults(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
+    const retentionAfter = measureToolUseResultRetention(messagesForQuery)
+    const scrubbedThisTurn =
+      retentionBefore.withToolUseResult - retentionAfter.withToolUseResult
+
+    // fix546.5: also strip aged tool_result.content strings, not just the
+    // structured toolUseResult sibling. Closes the linear growth path that
+    // was still active in the fix546.4 trace (state.messages content blocks).
+    const contentScrub = scrubAgedToolResultContent(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
+    messagesForQuery = contentScrub.messages
+
+    // fix546.6: aged-image scrubber — strips ALL image blocks past the
+    // keep-recent window (not just >=2 KB ones). AICTL-style workloads
+    // accumulate hundreds of screenshots/Read-image base64 strings; even
+    // small ones add up in the REPL React-state retainer. Keep the same
+    // window as toolResults so behavior is predictable for users tuning
+    // OPENCLAUDE_KEEP_RECENT_TOOL_RESULTS.
+    const imageScrub = scrubAgedImages(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
+    messagesForQuery = imageScrub.messages
+
+    // fix546.7: aged async-hook-attachment scrubber — clears stdout/stderr/
+    // response payloads on aged `async_hook_response` AttachmentMessages.
+    // With matcher `.*` on PreToolUse, tool-heavy turns accumulate one
+    // attachment per tool call. Display is already suppressed in non-verbose
+    // mode but the data lived forever in REPL React state. Audit fields
+    // (hookName/hookEvent/toolName/exitCode/processId) are preserved.
+    const hookScrub = scrubAgedHookAttachments(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
+    messagesForQuery = hookScrub.messages
+
+    // fix546.6: mirror scrubbed messages back to the REPL React state.
+    // Without this, scrubAgedToolResultContent + scrubAgedImages only
+    // affect the engine-side `messagesForQuery` copy — `messagesRef.current`
+    // in REPL.tsx still holds the originals, which is the actual heap
+    // retainer per the 2026-05-22 post-fix546.5 analysis. The REPL handler
+    // matches messages by uuid and skips entries no longer in state
+    // (covers post-compact removals).
+    if (
+      toolUseContext.syncScrubbedMessages &&
+      (contentScrub.replacedCount > 0 ||
+        imageScrub.replacedCount > 0 ||
+        hookScrub.replacedCount > 0)
+    ) {
+      toolUseContext.syncScrubbedMessages(messagesForQuery)
+    }
+
+    // Bound ContentReplacementState (seenIds + replacements maps grow
+    // monotonically across a long session — secondary leak path identified
+    // alongside #546 fix). LRU by insertion order; correctness untouched
+    // because stale UUID entries are inert outside the live message window.
+    const crsCap = parseEnvCRSCap()
+    const evictedThisTurn = trimContentReplacementState(
+      toolUseContext.contentReplacementState,
+      crsCap,
+    )
+
+    // Emit diagnostic snapshot so the next OOM tells us where memory went.
+    emitTurnSnapshot({
+      retention: retentionAfter,
+      crs: measureContentReplacementState(
+        toolUseContext.contentReplacementState,
+      ),
+      scrubbed: scrubbedThisTurn,
+      evicted: evictedThisTurn,
+      contentScrubbed: contentScrub.replacedCount,
+      contentScrubbedBytes: contentScrub.replacedBytes,
+    })
+
+    // Targeted size probe: the turn snapshot's retention covers
+    // toolUseResult only. The actual wire-bound `messagesForQuery` array
+    // (with all content blocks, system blocks, tool definitions, etc.) is
+    // separate and may dominate heap for long sessions. This probe fires
+    // only on heap-threshold crossings — cheap when steady, loud when
+    // climbing. Approx the JSON-serialized size as a proxy for retained
+    // string bytes (V8 doesn't dedupe so this overestimates only for
+    // shared-prefix strings, which is fine for diagnostics).
+    try {
+      let approxMessagesBytes = 0
+      let contentBlockCount = 0
+      for (const m of messagesForQuery) {
+        // Only stringify the .message field — that's the wire body.
+        // Skip rendering the full Message wrapper to keep probe cheap.
+        approxMessagesBytes += JSON.stringify(m.message ?? '').length
+        const content = (m.message as { content?: unknown })?.content
+        if (Array.isArray(content)) contentBlockCount += content.length
+      }
+      emitProbe('query_pre_api', {
+        messagesForQueryLen: messagesForQuery.length,
+        approxMessagesBytes,
+        contentBlockCount,
+      })
+    } catch {
+      /* swallow */
     }
 
     // Apply snip before microcompact (both may run — they are not mutually exclusive).

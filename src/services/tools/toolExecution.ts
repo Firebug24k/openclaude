@@ -50,6 +50,7 @@ import {
   TOOL_SEARCH_TOOL_NAME,
 } from '../../tools/ToolSearchTool/prompt.js'
 import { getAllBaseTools } from '../../tools.js'
+import { emitProbe } from '../../utils/memDebug.js'
 import type { HookProgress } from '../../types/hooks.js'
 import type {
   AssistantMessage,
@@ -1435,6 +1436,29 @@ async function checkPermissionsAndCallTool(
             }
           : undefined,
       })
+
+      // Intra-turn probe — emits only on heap threshold crossings, so it's
+      // cheap on the hot path but catches mid-turn allocation spikes the
+      // turn-boundary probe in query.ts misses. Includes tool name and an
+      // approximate result size so a single huge tool output is identifiable.
+      try {
+        const resultBlock = contentBlocks[0]
+        const approxResultBytes =
+          resultBlock && (resultBlock as { type?: string }).type === 'tool_result'
+            ? typeof (resultBlock as { content?: unknown }).content === 'string'
+              ? ((resultBlock as { content: string }).content).length
+              : JSON.stringify((resultBlock as { content?: unknown }).content ?? '')
+                  .length
+            : 0
+        emitProbe('after_tool', {
+          tool: tool.name,
+          toolUseId: toolUseID,
+          approxResultBytes,
+          isAgent: Boolean(toolUseContext.agentId),
+        })
+      } catch {
+        /* swallow — diagnostics must never break the hot path */
+      }
     }
 
     // TOOD(hackyon): refactor so we don't have different experiences for MCP tools

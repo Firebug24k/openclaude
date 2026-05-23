@@ -1,7 +1,30 @@
 import { expect, test } from 'bun:test'
 
 import { createUserMessage } from './messages.ts'
-import { applyToolResultReplacementsToMessages } from './toolResultStorage.ts'
+import {
+  applyToolResultReplacementsToMessages,
+  createContentReplacementState,
+  measureContentReplacementState,
+  measureToolUseResultRetention,
+  scrubAgedHookAttachments,
+  scrubAgedImages,
+  scrubAgedToolUseResults,
+  trimContentReplacementState,
+} from './toolResultStorage.ts'
+
+function toolResultMsg(id: string, payload: string) {
+  return createUserMessage({
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: id,
+        content: payload,
+        is_error: false,
+      },
+    ],
+    toolUseResult: { stdout: payload, stderr: '' },
+  })
+}
 
 test('applyToolResultReplacementsToMessages replaces matching tool results and preserves unrelated messages', () => {
   const unrelated = createUserMessage({ content: 'keep me' })
@@ -56,4 +79,265 @@ test('applyToolResultReplacementsToMessages is idempotent when messages are alre
   )
 
   expect(next).toBe(messages)
+})
+
+test('scrubAgedToolUseResults keeps the N most recent toolUseResult payloads', () => {
+  const messages = [
+    toolResultMsg('a', 'aaa'),
+    toolResultMsg('b', 'bbb'),
+    toolResultMsg('c', 'ccc'),
+    toolResultMsg('d', 'ddd'),
+    toolResultMsg('e', 'eee'),
+  ]
+  const next = scrubAgedToolUseResults(messages, 2)
+  // Two most recent kept, three oldest scrubbed.
+  expect(next[0]!.toolUseResult).toBeUndefined()
+  expect(next[1]!.toolUseResult).toBeUndefined()
+  expect(next[2]!.toolUseResult).toBeUndefined()
+  expect(next[3]!.toolUseResult).toEqual({ stdout: 'ddd', stderr: '' })
+  expect(next[4]!.toolUseResult).toEqual({ stdout: 'eee', stderr: '' })
+})
+
+test('scrubAgedToolUseResults preserves wire content blocks (only nulls structured payload)', () => {
+  const messages = [toolResultMsg('a', 'aaa'), toolResultMsg('b', 'bbb')]
+  const next = scrubAgedToolUseResults(messages, 1)
+  // Old tool_result block content is untouched — the model still sees it.
+  expect(
+    (next[0]!.message.content as Array<{ type: string; content: string }>)[0]!
+      .content,
+  ).toBe('aaa')
+  expect(next[0]!.toolUseResult).toBeUndefined()
+})
+
+test('scrubAgedToolUseResults is a no-op when count <= keepRecent', () => {
+  const messages = [toolResultMsg('a', 'aaa'), toolResultMsg('b', 'bbb')]
+  const next = scrubAgedToolUseResults(messages, 5)
+  expect(next).toBe(messages)
+})
+
+test('scrubAgedToolUseResults skips user messages without toolUseResult when counting', () => {
+  const plain = createUserMessage({ content: 'hello' })
+  const messages = [
+    toolResultMsg('a', 'aaa'),
+    plain,
+    toolResultMsg('b', 'bbb'),
+    toolResultMsg('c', 'ccc'),
+  ]
+  const next = scrubAgedToolUseResults(messages, 2)
+  expect(next[0]!.toolUseResult).toBeUndefined() // scrubbed
+  expect(next[1]).toBe(plain) // unrelated user message untouched
+  expect(next[2]!.toolUseResult).toEqual({ stdout: 'bbb', stderr: '' })
+  expect(next[3]!.toolUseResult).toEqual({ stdout: 'ccc', stderr: '' })
+})
+
+test('scrubAgedToolUseResults with keepRecent=0 scrubs all', () => {
+  const messages = [toolResultMsg('a', 'aaa'), toolResultMsg('b', 'bbb')]
+  const next = scrubAgedToolUseResults(messages, 0)
+  expect(next[0]!.toolUseResult).toBeUndefined()
+  expect(next[1]!.toolUseResult).toBeUndefined()
+})
+
+test('scrubAgedToolUseResults with negative keepRecent returns input', () => {
+  const messages = [toolResultMsg('a', 'aaa')]
+  const next = scrubAgedToolUseResults(messages, -1)
+  expect(next).toBe(messages)
+})
+
+test('scrubAgedToolUseResults on empty array is a no-op', () => {
+  const next = scrubAgedToolUseResults([], 5)
+  expect(next).toEqual([])
+})
+
+test('measureToolUseResultRetention counts and ranks payloads by size', () => {
+  const messages = [
+    toolResultMsg('a', 'x'.repeat(10)),
+    toolResultMsg('b', 'x'.repeat(1000)),
+    toolResultMsg('c', 'x'.repeat(100)),
+  ]
+  const stats = measureToolUseResultRetention(messages)
+  expect(stats.totalMessages).toBe(3)
+  expect(stats.userMessages).toBe(3)
+  expect(stats.withToolUseResult).toBe(3)
+  expect(stats.approxBytes).toBeGreaterThan(1100)
+  expect(stats.topPayloads).toHaveLength(3)
+  // Top-1 should be the biggest payload (index 1, 'b')
+  expect(stats.topPayloads[0]!.toolUseId).toBe('b')
+  expect(stats.topPayloads[0]!.size).toBeGreaterThan(stats.topPayloads[1]!.size)
+})
+
+test('measureToolUseResultRetention ignores scrubbed (undefined) payloads', () => {
+  const messages = [toolResultMsg('a', 'aaa')]
+  const scrubbed = scrubAgedToolUseResults(messages, 0)
+  const stats = measureToolUseResultRetention(scrubbed)
+  expect(stats.withToolUseResult).toBe(0)
+  expect(stats.approxBytes).toBe(0)
+})
+
+test('trimContentReplacementState evicts oldest entries when over cap', () => {
+  const state = createContentReplacementState()
+  for (let i = 0; i < 10; i++) {
+    state.seenIds.add(`id-${i}`)
+    state.replacements.set(`id-${i}`, `r-${i}`)
+  }
+  const evicted = trimContentReplacementState(state, 3)
+  expect(evicted).toBe(7)
+  expect(state.seenIds.size).toBe(3)
+  expect(state.replacements.size).toBe(3)
+  // Oldest were evicted, newest survive
+  expect(state.replacements.has('id-9')).toBe(true)
+  expect(state.replacements.has('id-0')).toBe(false)
+})
+
+test('trimContentReplacementState is a no-op when within cap', () => {
+  const state = createContentReplacementState()
+  state.seenIds.add('id-1')
+  state.replacements.set('id-1', 'r-1')
+  expect(trimContentReplacementState(state, 10)).toBe(0)
+  expect(state.seenIds.size).toBe(1)
+})
+
+test('measureContentReplacementState reports sizes', () => {
+  const state = createContentReplacementState()
+  state.seenIds.add('a')
+  state.seenIds.add('b')
+  state.replacements.set('a', 'hello')
+  const stats = measureContentReplacementState(state)
+  expect(stats.seenIds).toBe(2)
+  expect(stats.replacements).toBe(1)
+  expect(stats.approxReplacementBytes).toBe(5)
+})
+
+test('measureContentReplacementState handles undefined state', () => {
+  const stats = measureContentReplacementState(undefined)
+  expect(stats).toEqual({ seenIds: 0, replacements: 0, approxReplacementBytes: 0 })
+})
+
+// fix546.6: scrubAgedImages smoke tests.
+
+function userWithImage(id: string, base64: string) {
+  return createUserMessage({
+    content: [
+      {
+        type: 'tool_result' as const,
+        tool_use_id: id,
+        content: [
+          {
+            type: 'image' as const,
+            source: { type: 'base64', media_type: 'image/png', data: base64 },
+          },
+        ],
+      },
+    ],
+  })
+}
+
+test('scrubAgedImages replaces images on aged messages and keeps recent ones', () => {
+  const messages = [
+    userWithImage('a', 'AAAA'.repeat(100)),
+    userWithImage('b', 'BBBB'.repeat(100)),
+    userWithImage('c', 'CCCC'.repeat(100)),
+  ]
+  const { messages: out, replacedCount, replacedBytes } = scrubAgedImages(messages, 1)
+  expect(replacedCount).toBe(2)
+  expect(replacedBytes).toBeGreaterThan(0)
+  // Last (recent) message preserved as-is
+  expect(out[2]).toBe(messages[2])
+  // Earlier messages had their image block (nested inside the tool_result
+  // content array) replaced with a text placeholder. The outer tool_result
+  // wrapper is preserved.
+  const firstBlock = (out[0]!.message.content as Array<{ type: string; content?: unknown }>)[0]!
+  expect(firstBlock.type).toBe('tool_result')
+  const nested = (firstBlock.content as Array<{ type: string; text?: string }>)[0]!
+  expect(nested.type).toBe('text')
+  expect(nested.text).toContain('aged-image')
+})
+
+test('scrubAgedImages is a no-op when nothing is old enough', () => {
+  const messages = [userWithImage('a', 'AAAA'.repeat(100))]
+  const result = scrubAgedImages(messages, 5)
+  expect(result.replacedCount).toBe(0)
+  expect(result.messages).toBe(messages)
+})
+
+test('scrubAgedImages handles top-level image content blocks (vision uploads)', () => {
+  const userImg = createUserMessage({
+    content: [
+      {
+        type: 'image' as const,
+        source: { type: 'base64', media_type: 'image/png', data: 'ZZZZ'.repeat(50) },
+      },
+    ],
+  })
+  const recent = createUserMessage({ content: 'recent' })
+  const { messages: out, replacedCount } = scrubAgedImages([userImg, recent], 0)
+  expect(replacedCount).toBe(1)
+  const block = (out[0]!.message.content as Array<{ type: string; text?: string }>)[0]!
+  expect(block.type).toBe('text')
+})
+
+// fix546.7: scrubAgedHookAttachments smoke tests.
+
+function hookAttachmentMsg(processId: string, stdout: string, stderr = '') {
+  return {
+    type: 'attachment',
+    uuid: `uuid-${processId}`,
+    timestamp: new Date().toISOString(),
+    attachment: {
+      type: 'async_hook_response',
+      processId,
+      hookName: 'PreToolUse',
+      hookEvent: 'PreToolUse',
+      toolName: 'Bash',
+      response: { systemMessage: 'noisy details ' + stdout },
+      stdout,
+      stderr,
+      exitCode: 0,
+    },
+  }
+}
+
+test('scrubAgedHookAttachments clears stdout/stderr/response on aged async_hook_response attachments', () => {
+  const messages = [
+    hookAttachmentMsg('a', 'AAAA'.repeat(100), 'errA'),
+    hookAttachmentMsg('b', 'BBBB'.repeat(100), 'errB'),
+    hookAttachmentMsg('c', 'CCCC'.repeat(100)),
+  ]
+  const { messages: out, replacedCount, replacedBytes } = scrubAgedHookAttachments(messages, 1)
+  expect(replacedCount).toBe(2)
+  expect(replacedBytes).toBeGreaterThan(0)
+  // Last (recent) attachment preserved as-is
+  expect(out[2]).toBe(messages[2])
+  // Earlier attachments had heavy fields cleared
+  const first = (out[0] as { attachment: { stdout: string; stderr: string; response: object } }).attachment
+  expect(first.stdout).toBe('')
+  expect(first.stderr).toBe('')
+  expect(first.response).toEqual({})
+})
+
+test('scrubAgedHookAttachments preserves hookEvent + hookName + exitCode (audit fields)', () => {
+  const messages = [hookAttachmentMsg('a', 'AAAA'.repeat(100)), hookAttachmentMsg('b', '')]
+  const { messages: out } = scrubAgedHookAttachments(messages, 1)
+  const first = (out[0] as {
+    attachment: {
+      type: string
+      processId: string
+      hookName: string
+      hookEvent: string
+      toolName: string
+      exitCode: number
+    }
+  }).attachment
+  expect(first.type).toBe('async_hook_response')
+  expect(first.processId).toBe('a')
+  expect(first.hookName).toBe('PreToolUse')
+  expect(first.hookEvent).toBe('PreToolUse')
+  expect(first.toolName).toBe('Bash')
+  expect(first.exitCode).toBe(0)
+})
+
+test('scrubAgedHookAttachments leaves recent attachments untouched', () => {
+  const messages = [hookAttachmentMsg('a', 'AAAA'.repeat(100))]
+  const result = scrubAgedHookAttachments(messages, 5)
+  expect(result.replacedCount).toBe(0)
+  expect(result.messages).toBe(messages)
 })

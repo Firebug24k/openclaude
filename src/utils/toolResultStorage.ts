@@ -750,6 +750,498 @@ export function applyToolResultReplacementsToMessages(
   return replaceToolResultContents(messages, replacements)
 }
 
+/**
+ * Drop the structured `toolUseResult` payload from aged user messages.
+ *
+ * Background: `addToolResult` (toolExecution.ts) stores the full raw result
+ * object on the parent UserMessage so UI consumers (transcript scrollback,
+ * turn diffs, transcript search, collapsed read/search rendering) can re-
+ * inspect it. The on-disk JSONL transcript also carries it, so resume keeps
+ * working. The problem is that the **in-memory** transcript retains every
+ * tool result forever — for tools whose persistence threshold is Infinity
+ * (Read), or whose per-tool result is under threshold (most Greps/Bashes
+ * under 30K-50K), it is never cleared. A long continuous session (1000s of
+ * tool calls reading model-training files) leaks GBs of strings and V8 OOMs.
+ *
+ * This scrubber runs once per turn and keeps the structured payload only on
+ * the `keepRecent` most recent user messages that have one — old payloads
+ * are nulled out. The wire-bound `tool_result` content blocks are untouched
+ * (the model still sees what the prior turn saw), and disk persistence
+ * already wrote the full payload before this runs. UI consumers gracefully
+ * fall back to the content block when `toolUseResult` is undefined.
+ *
+ * Subagents are unaffected because their `addToolResult` site already drops
+ * `toolUseResult` (toolExecution.ts:1493). This change brings the main REPL
+ * to the same memory profile, just with a generous keep-recent window so
+ * recent UI scrollback is unchanged.
+ */
+export function scrubAgedToolUseResults(
+  messages: Message[],
+  keepRecent: number,
+): Message[] {
+  if (keepRecent < 0 || messages.length === 0) return messages
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.type !== 'user' || m.toolUseResult === undefined) continue
+    if (kept < keepRecent) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) return messages
+  return messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (m.type !== 'user' || m.toolUseResult === undefined) return m
+    return { ...m, toolUseResult: undefined }
+  })
+}
+/**
+ * Sibling of scrubAgedToolUseResults — replaces the in-memory wire-bound
+ * tool_result content strings on aged user messages with a short placeholder.
+ *
+ * Why this is safe:
+ *  - The JSONL transcript already wrote the original content to disk before
+ *    this runs, so `/resume` and post-mortem read the originals.
+ *  - The API call only sends the most recent ~keepRecent turns anyway
+ *    (microCompact + provider truncation), so replaced strings on older
+ *    messages were not going on the wire.
+ *  - `applyToolResultBudget` already replaces large results with CRS UUIDs
+ *    when over budget — this fills the gap for results that stayed under
+ *    budget but persisted on the heap.
+ *
+ * Threshold: only strings > 2 KB are replaced (small Bash returns and
+ * status pings stay legible in scrollback).
+ */
+export function scrubAgedToolResultContent(
+  messages: Message[],
+  keepRecent: number,
+  minSizeBytes = 2048,
+): { messages: Message[]; replacedCount: number; replacedBytes: number } {
+  if (keepRecent < 0 || messages.length === 0) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+  // Find the index of the keepRecent-th user-with-tool_result from the end.
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.type !== 'user') continue
+    const content = Array.isArray(m.message.content) ? m.message.content : []
+    const hasToolResult = content.some(
+      b => b && (b as { type?: string }).type === 'tool_result',
+    )
+    if (!hasToolResult) continue
+    if (kept < keepRecent) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) return { messages, replacedCount: 0, replacedBytes: 0 }
+
+  let replacedCount = 0
+  let replacedBytes = 0
+  const out = messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (m?.type !== 'user') return m
+    const content = Array.isArray(m.message.content) ? m.message.content : null
+    if (!content) return m
+    let touched = false
+    const newContent = content.map(b => {
+      const block = b as { type?: string; content?: unknown; tool_use_id?: string }
+      if (block?.type !== 'tool_result') return b
+      const c = block.content
+      // content can be string OR Array<{type:'text'|'image', text?, source?}>
+      if (typeof c === 'string') {
+        if (c.length < minSizeBytes) return b
+        replacedCount++
+        replacedBytes += c.length
+        touched = true
+        return { ...block, content: '[older tool result truncated for memory]' }
+      }
+      if (Array.isArray(c)) {
+        let arrTouched = false
+        const newArr = c.map(part => {
+          const p = part as { type?: string; text?: string; source?: { data?: string } }
+          if (p?.type === 'text' && typeof p.text === 'string' && p.text.length >= minSizeBytes) {
+            replacedCount++
+            replacedBytes += p.text.length
+            arrTouched = true
+            return { ...p, text: '[older tool result truncated for memory]' }
+          }
+          if (p?.type === 'image' && p.source && typeof p.source.data === 'string'
+              && p.source.data.length >= minSizeBytes) {
+            replacedCount++
+            replacedBytes += p.source.data.length
+            arrTouched = true
+            return { type: 'text', text: '[older image truncated for memory]' }
+          }
+          return part
+        })
+        if (arrTouched) { touched = true; return { ...block, content: newArr } }
+        return b
+      }
+      return b
+    })
+    return touched ? { ...m, message: { ...m.message, content: newContent } } : m
+  })
+  return { messages: out, replacedCount, replacedBytes }
+}
+
+
+/**
+ * fix546.6: Aggressive aged-image scrubber. Distinct from
+ * scrubAgedToolResultContent, which only touches images >= minSizeBytes
+ * inside tool_result content arrays. This pass:
+ *   - replaces ALL image content blocks (any size) on aged user messages
+ *   - replaces images regardless of whether they're inside a tool_result
+ *     wrapper or as top-level user content blocks (vision uploads, etc.)
+ *
+ * Rationale (post-fix546.5 OOM 2026-05-22): screenshot/Read-image-heavy
+ * sessions (aictl) accumulate base64 image strings in REPL React state.
+ * Each can be 50–500 KB; once the model has consumed them they are pure
+ * heap dead-weight. The on-disk JSONL transcript retains originals.
+ *
+ * `keepRecentImages` controls how many of the most-recent image-bearing
+ * user messages are left untouched. Older image blocks become text
+ * placeholders.
+ */
+export function scrubAgedImages(
+  messages: Message[],
+  keepRecentImages: number,
+): { messages: Message[]; replacedCount: number; replacedBytes: number } {
+  if (keepRecentImages < 0 || messages.length === 0) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  // Cheap presence check: does a content array contain any image block,
+  // either as a top-level user image, or inside a tool_result's content
+  // array? Walk shallowly — we only need to know "is there one".
+  const hasImage = (m: Message): boolean => {
+    if (m?.type !== 'user') return false
+    const content = Array.isArray(m.message?.content) ? m.message.content : null
+    if (!content) return false
+    for (const b of content) {
+      const block = b as { type?: string; content?: unknown; source?: unknown }
+      if (block?.type === 'image') return true
+      if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+        for (const part of block.content) {
+          const p = part as { type?: string }
+          if (p?.type === 'image') return true
+        }
+      }
+    }
+    return false
+  }
+
+  // Find the cutoff: the index of the keepRecentImages-th image-bearing
+  // user message counting from the end. All image-bearing messages strictly
+  // before this index get scrubbed.
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!hasImage(messages[i] as Message)) continue
+    if (kept < keepRecentImages) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  const PLACEHOLDER =
+    '[image removed by aged-image scrubber to control heap]'
+  let replacedCount = 0
+  let replacedBytes = 0
+
+  const imageBytes = (src: unknown): number => {
+    const s = src as { data?: string } | null
+    if (s && typeof s.data === 'string') return s.data.length
+    return 256 // small fallback for non-base64 sources
+  }
+
+  const out = messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (m?.type !== 'user') return m
+    const content = Array.isArray(m.message?.content) ? m.message.content : null
+    if (!content) return m
+    let touched = false
+    const newContent = content.map(b => {
+      const block = b as {
+        type?: string
+        content?: unknown
+        source?: unknown
+      }
+      if (block?.type === 'image') {
+        replacedCount++
+        replacedBytes += imageBytes(block.source)
+        touched = true
+        return { type: 'text', text: PLACEHOLDER }
+      }
+      if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+        let arrTouched = false
+        const newArr = block.content.map(part => {
+          const p = part as { type?: string; source?: unknown }
+          if (p?.type === 'image') {
+            replacedCount++
+            replacedBytes += imageBytes(p.source)
+            arrTouched = true
+            return { type: 'text', text: PLACEHOLDER }
+          }
+          return part
+        })
+        if (arrTouched) {
+          touched = true
+          return { ...block, content: newArr }
+        }
+        return b
+      }
+      return b
+    })
+    return touched
+      ? { ...m, message: { ...m.message, content: newContent } }
+      : m
+  })
+
+  return { messages: out, replacedCount, replacedBytes }
+}
+
+/**
+ * fix546.7: Aged async-hook-attachment scrubber.
+ *
+ * Each async hook completion creates an `async_hook_response` AttachmentMessage
+ * (see src/utils/attachments.ts:341-351 + 3511-3520). The wrapper is retained
+ * in REPL React state (`messagesRef.current`) — the same retainer the
+ * post-fix546.5 OOM post-mortem identified. With matcher `.*` on PreToolUse,
+ * tool-heavy turns (aictl 100+ tool calls/turn) accumulate hundreds of these
+ * per user turn. The display is suppressed in non-verbose mode but the data
+ * is retained.
+ *
+ * This scrubber clears the heavy payload fields (`stdout`, `stderr`,
+ * `response`) on aged attachments, while preserving audit fields
+ * (`hookName`, `hookEvent`, `toolName`, `exitCode`, `processId`, `type`).
+ *
+ * Mirrors `scrubAgedImages` for caller symmetry: `keepRecent` is the count
+ * of the most-recent async_hook_response attachment-bearing messages left
+ * untouched.
+ */
+export function scrubAgedHookAttachments(
+  messages: Message[],
+  keepRecent: number,
+): { messages: Message[]; replacedCount: number; replacedBytes: number } {
+  if (keepRecent < 0 || messages.length === 0) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  const isAgedHookAttachment = (m: Message): boolean => {
+    if (m?.type !== 'attachment') return false
+    const att = m.attachment as { type?: string } | undefined
+    return att?.type === 'async_hook_response'
+  }
+
+  // Find the cutoff: the index of the keepRecent-th hook-attachment message
+  // counting from the end. All such messages strictly before this index get
+  // scrubbed.
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!isAgedHookAttachment(messages[i] as Message)) continue
+    if (kept < keepRecent) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  let replacedCount = 0
+  let replacedBytes = 0
+
+  const fieldBytes = (v: unknown): number => {
+    if (typeof v === 'string') return v.length
+    if (v === undefined || v === null) return 0
+    try {
+      return JSON.stringify(v).length
+    } catch {
+      return 256
+    }
+  }
+
+  const out = messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (!isAgedHookAttachment(m as Message)) return m
+    const att = (m as { attachment: unknown }).attachment as {
+      type?: string
+      stdout?: string
+      stderr?: string
+      response?: unknown
+    }
+    const stdout = att.stdout ?? ''
+    const stderr = att.stderr ?? ''
+    const response = att.response
+    // Skip if already scrubbed (nothing heavy to drop).
+    if (
+      stdout === '' &&
+      stderr === '' &&
+      (response === undefined ||
+        (response &&
+          typeof response === 'object' &&
+          Object.keys(response as object).length === 0))
+    ) {
+      return m
+    }
+    replacedBytes += fieldBytes(stdout) + fieldBytes(stderr) + fieldBytes(response)
+    replacedCount++
+    return {
+      ...(m as object),
+      attachment: {
+        ...att,
+        stdout: '',
+        stderr: '',
+        response: {},
+      },
+    }
+  })
+
+  return { messages: out, replacedCount, replacedBytes }
+}
+
+/**
+ * Rough byte cost of a `toolUseResult` payload. We don't need exactness —
+ * just a relative signal of which retained payloads dominate memory.
+ * Uses JSON.stringify length where possible, falling back to a constant
+ * sentinel for circular/non-serializable values.
+ */
+function approxToolUseResultBytes(v: unknown): number {
+  if (v === undefined || v === null) return 0
+  if (typeof v === 'string') return v.length
+  try {
+    return JSON.stringify(v).length
+  } catch {
+    return 256
+  }
+}
+
+type ToolUseResultRetention = {
+  totalMessages: number
+  userMessages: number
+  withToolUseResult: number
+  approxBytes: number
+  topPayloads: Array<{ index: number; size: number; toolUseId?: string }>
+}
+
+/**
+ * Cheap snapshot of how much memory toolUseResult retention is consuming.
+ * Walks the Message[] once. Designed to be safe to call every turn.
+ * `topN` defaults to 3 — we just want the worst offenders, not a full list.
+ */
+export function measureToolUseResultRetention(
+  messages: Message[],
+  topN = 3,
+): ToolUseResultRetention {
+  let userMessages = 0
+  let withToolUseResult = 0
+  let approxBytes = 0
+  const top: Array<{ index: number; size: number; toolUseId?: string }> = []
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (m?.type !== 'user') continue
+    userMessages++
+    if (m.toolUseResult === undefined) continue
+    withToolUseResult++
+    const size = approxToolUseResultBytes(m.toolUseResult)
+    approxBytes += size
+    if (top.length < topN) {
+      const content = Array.isArray(m.message.content) ? m.message.content : []
+      const tr = content.find(b => b && (b as { type?: string }).type === 'tool_result') as
+        | { tool_use_id?: string }
+        | undefined
+      top.push({ index: i, size, toolUseId: tr?.tool_use_id })
+      top.sort((a, b) => b.size - a.size)
+    } else if (size > top[top.length - 1]!.size) {
+      const content = Array.isArray(m.message.content) ? m.message.content : []
+      const tr = content.find(b => b && (b as { type?: string }).type === 'tool_result') as
+        | { tool_use_id?: string }
+        | undefined
+      top[top.length - 1] = { index: i, size, toolUseId: tr?.tool_use_id }
+      top.sort((a, b) => b.size - a.size)
+    }
+  }
+  return {
+    totalMessages: messages.length,
+    userMessages,
+    withToolUseResult,
+    approxBytes,
+    topPayloads: top,
+  }
+}
+
+type ContentReplacementStateStats = {
+  seenIds: number
+  replacements: number
+  approxReplacementBytes: number
+}
+
+export function measureContentReplacementState(
+  state: ContentReplacementState | undefined,
+): ContentReplacementStateStats {
+  if (!state) return { seenIds: 0, replacements: 0, approxReplacementBytes: 0 }
+  let bytes = 0
+  for (const v of state.replacements.values()) bytes += v.length
+  return {
+    seenIds: state.seenIds.size,
+    replacements: state.replacements.size,
+    approxReplacementBytes: bytes,
+  }
+}
+
+/**
+ * Bound the ContentReplacementState to prevent monotonic growth across a
+ * long session. Set/Map iteration order is insertion order, so evicting the
+ * "oldest" key is just deleting the first iterated key. We trim until both
+ * structures are at-or-below `max`.
+ *
+ * Correctness: per the docstring on ContentReplacementState, stale entries
+ * are looked up only by tool_use_id (UUID); evicting an old id only causes
+ * that result to be re-evaluated as "fresh" if it later reappears in the
+ * messages window. In practice older results are well outside that window
+ * by the time we evict. The docstring already accepts that stale entries
+ * are inert — eviction has no correctness cost in the live window.
+ */
+export function trimContentReplacementState(
+  state: ContentReplacementState | undefined,
+  max: number,
+): number {
+  if (!state || max < 0) return 0
+  let evicted = 0
+  while (state.seenIds.size > max) {
+    const first = state.seenIds.values().next().value
+    if (first === undefined) break
+    state.seenIds.delete(first)
+    state.replacements.delete(first)
+    evicted++
+  }
+  while (state.replacements.size > max) {
+    const first = state.replacements.keys().next().value
+    if (first === undefined) break
+    state.replacements.delete(first)
+    state.seenIds.delete(first)
+    evicted++
+  }
+  return evicted
+}
+
 async function buildReplacement(
   candidate: ToolResultCandidate,
 ): Promise<{ content: string; originalSize: number } | null> {
