@@ -180,7 +180,8 @@ import { deserializeMessages } from '../utils/conversationRecovery.js';
 import { extractReadFilesFromMessages, extractBashToolsFromMessages } from '../utils/queryHelpers.js';
 import { resetMicrocompactState } from '../services/compact/microCompact.js';
 import { runPostCompactCleanup } from '../services/compact/postCompactCleanup.js';
-import { applyToolResultReplacementsToMessages, provisionContentReplacementState, reconstructContentReplacementState, type ContentReplacementRecord } from '../utils/toolResultStorage.js';
+import { applyToolResultReplacementsToMessages, provisionContentReplacementState, reconstructContentReplacementState, scrubAgedImages, type ContentReplacementRecord } from '../utils/toolResultStorage.js';
+import { emitProbe } from '../utils/memDebug.js';
 import { partialCompactConversation } from '../services/compact/compact.js';
 import type { LogOption } from '../types/logs.js';
 import type { AgentColorName } from '../tools/AgentTool/agentColorManager.js';
@@ -1243,6 +1244,64 @@ export function REPL({
   const syncToolResultReplacements = useCallback((replacements: ReadonlyMap<string, string>) => {
     if (replacements.size === 0) return;
     setMessages(current => applyToolResultReplacementsToMessages(current, replacements));
+  }, [setMessages]);
+  // fix546.6: receive engine-side scrubbed messages and mirror them into
+  // the REPL React state. Matches by uuid; skips entries that no longer
+  // exist (post-compact / rewind / hydrate). The engine sends the full
+  // post-scrub slice — we only swap in the entries that REPL state still
+  // tracks, leaving any newer or compact-trimmed messages alone.
+  const syncScrubbedMessages = useCallback((scrubbedMessages: MessageType[]) => {
+    if (!Array.isArray(scrubbedMessages) || scrubbedMessages.length === 0) return;
+    const byUuid = new Map<string, Message>();
+    for (const m of scrubbedMessages) {
+      if (m && typeof (m as { uuid?: string }).uuid === 'string') {
+        byUuid.set((m as { uuid: string }).uuid, m);
+      }
+    }
+    if (byUuid.size === 0) return;
+    setMessages(current => {
+      let changed = false;
+      const next = current.map((m: MessageType) => {
+        const uuid = m && typeof (m as { uuid?: string }).uuid === 'string'
+          ? (m as { uuid: string }).uuid
+          : undefined;
+        if (!uuid) return m;
+        const replacement = byUuid.get(uuid);
+        if (replacement === undefined || replacement === m) return m;
+        changed = true;
+        return replacement;
+      });
+      return changed ? next : current;
+    });
+    // fix546.6 patch 2: emit a repl_state probe so the next OOM trace has
+    // visibility into the REPL retainer the engine-side snapshot misses.
+    try {
+      let approxBytes = 0;
+      let imageBlockCount = 0;
+      // messagesRef.current is the freshly-updated React state by the time
+      // emitProbe runs after setMessages — but to be safe against the
+      // commit-vs-set ordering, sample the scrubbed slice we just applied.
+      for (const m of scrubbedMessages) {
+        try { approxBytes += JSON.stringify((m as { message?: unknown }).message ?? '').length; } catch { /* skip */ }
+        const content = (m as { message?: { content?: unknown } }).message?.content;
+        if (Array.isArray(content)) {
+          for (const b of content) {
+            const block = b as { type?: string; content?: unknown };
+            if (block?.type === 'image') imageBlockCount++;
+            else if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+              for (const p of block.content) {
+                if ((p as { type?: string })?.type === 'image') imageBlockCount++;
+              }
+            }
+          }
+        }
+      }
+      emitProbe('repl_state', {
+        length: scrubbedMessages.length,
+        approxBytes,
+        imageBlockCount,
+      });
+    } catch { /* probe is best-effort */ }
   }, [setMessages]);
   // Fullscreen: track the unseen-divider position. dividerIndex changes
   // only ~twice/scroll-session (first scroll-away + repin). pillVisible
@@ -2554,9 +2613,10 @@ export function REPL({
       setConversationId,
       requestPrompt: feature('HOOK_PROMPTS') ? requestPrompt : undefined,
       contentReplacementState: contentReplacementStateRef.current,
-      syncToolResultReplacements
+      syncToolResultReplacements,
+      syncScrubbedMessages
     };
-  }, [commands, combinedInitialTools, mainThreadAgentDefinition, debug, initialMcpClients, ideInstallationStatus, dynamicMcpConfig, theme, allowedAgentTypes, store, setAppState, reverify, addNotification, setMessages, onChangeDynamicMcpConfig, resume, requestPrompt, disabled, customSystemPrompt, appendSystemPrompt, setConversationId, syncToolResultReplacements]);
+  }, [commands, combinedInitialTools, mainThreadAgentDefinition, debug, initialMcpClients, ideInstallationStatus, dynamicMcpConfig, theme, allowedAgentTypes, store, setAppState, reverify, addNotification, setMessages, onChangeDynamicMcpConfig, resume, requestPrompt, disabled, customSystemPrompt, appendSystemPrompt, setConversationId, syncToolResultReplacements, syncScrubbedMessages]);
 
   // Session backgrounding (Ctrl+B to background/foreground)
   const handleBackgroundQuery = useCallback(() => {
@@ -2628,9 +2688,19 @@ export function REPL({
         // are O(n) per render, so drop everything before the previous
         // boundary to keep n bounded across multi-day sessions.
         if (isFullscreenEnvEnabled()) {
-          setMessages(old => [...getMessagesAfterCompactBoundary(old, {
-            includeSnipped: true
-          }), newMessage]);
+          setMessages(old => {
+            // fix546.6: even in fullscreen we strip aged images from the
+            // retained pre-compact scrollback. Without this, every
+            // screenshot the model has already consumed lives forever in
+            // React state and dominates per-turn growth.
+            const kept = [
+              ...getMessagesAfterCompactBoundary(old, {
+                includeSnipped: true
+              }),
+              newMessage
+            ];
+            return scrubAgedImages(kept, 25).messages;
+          });
         } else {
           setMessages(() => [newMessage]);
         }

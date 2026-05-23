@@ -306,6 +306,15 @@ export type ToolUseContext = {
     replacements: ReadonlyMap<string, string>,
   ) => void
   /**
+   * fix546.6 — Interactive REPL only: mirror engine-side message scrubbing
+   * (scrubAgedToolResultContent, scrubAgedImages) back into the REPL React
+   * state. Without this, the engine's `messagesForQuery` is scrubbed but
+   * `messagesRef.current` (the REPL's setMessages-driven state) retains the
+   * originals — that's the actual heap retainer identified in the 2026-05-22
+   * post-fix546.5 OOM analysis. Implementation matches messages by uuid.
+   */
+  syncScrubbedMessages?: (scrubbedMessages: Message[]) => void
+  /**
    * Parent's rendered system prompt bytes, frozen at turn start.
    * Used by fork subagents to share the parent's prompt cache — re-calling
    * getSystemPrompt() at fork-spawn time can diverge (GrowthBook cold→warm)

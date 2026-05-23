@@ -102,6 +102,7 @@ import {
   measureToolUseResultRetention,
   scrubAgedToolUseResults,
   scrubAgedToolResultContent,
+  scrubAgedImages,
   trimContentReplacementState,
 } from './utils/toolResultStorage.js'
 import {
@@ -466,6 +467,32 @@ async function* queryLoop(
       keepRecentToolResults,
     )
     messagesForQuery = contentScrub.messages
+
+    // fix546.6: aged-image scrubber — strips ALL image blocks past the
+    // keep-recent window (not just >=2 KB ones). AICTL-style workloads
+    // accumulate hundreds of screenshots/Read-image base64 strings; even
+    // small ones add up in the REPL React-state retainer. Keep the same
+    // window as toolResults so behavior is predictable for users tuning
+    // OPENCLAUDE_KEEP_RECENT_TOOL_RESULTS.
+    const imageScrub = scrubAgedImages(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
+    messagesForQuery = imageScrub.messages
+
+    // fix546.6: mirror scrubbed messages back to the REPL React state.
+    // Without this, scrubAgedToolResultContent + scrubAgedImages only
+    // affect the engine-side `messagesForQuery` copy — `messagesRef.current`
+    // in REPL.tsx still holds the originals, which is the actual heap
+    // retainer per the 2026-05-22 post-fix546.5 analysis. The REPL handler
+    // matches messages by uuid and skips entries no longer in state
+    // (covers post-compact removals).
+    if (
+      toolUseContext.syncScrubbedMessages &&
+      (contentScrub.replacedCount > 0 || imageScrub.replacedCount > 0)
+    ) {
+      toolUseContext.syncScrubbedMessages(messagesForQuery)
+    }
 
     // Bound ContentReplacementState (seenIds + replacements maps grow
     // monotonically across a long session — secondary leak path identified
