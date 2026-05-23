@@ -31,6 +31,18 @@ const HEAP_THRESHOLDS_BYTES = [
   1536 * 1024 * 1024,
   2048 * 1024 * 1024,
   3072 * 1024 * 1024,
+  // fix546.6: extend past 3 GB so intra-turn probes keep firing on long
+  // sessions. fix546.5's mem-debug saturated at 3 GB and lost diagnostic
+  // coverage for the final ~5 GB of growth before OOM at 8 GB.
+  3584 * 1024 * 1024,
+  4096 * 1024 * 1024,
+  4608 * 1024 * 1024,
+  5120 * 1024 * 1024,
+  5632 * 1024 * 1024,
+  6144 * 1024 * 1024,
+  6656 * 1024 * 1024,
+  7168 * 1024 * 1024,
+  7680 * 1024 * 1024,
 ]
 
 const STATE = {
