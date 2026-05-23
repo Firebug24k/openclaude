@@ -6,6 +6,7 @@ import {
   createContentReplacementState,
   measureContentReplacementState,
   measureToolUseResultRetention,
+  scrubAgedImages,
   scrubAgedToolUseResults,
   trimContentReplacementState,
 } from './toolResultStorage.ts'
@@ -208,4 +209,67 @@ test('measureContentReplacementState reports sizes', () => {
 test('measureContentReplacementState handles undefined state', () => {
   const stats = measureContentReplacementState(undefined)
   expect(stats).toEqual({ seenIds: 0, replacements: 0, approxReplacementBytes: 0 })
+})
+
+// fix546.6: scrubAgedImages smoke tests.
+
+function userWithImage(id: string, base64: string) {
+  return createUserMessage({
+    content: [
+      {
+        type: 'tool_result' as const,
+        tool_use_id: id,
+        content: [
+          {
+            type: 'image' as const,
+            source: { type: 'base64', media_type: 'image/png', data: base64 },
+          },
+        ],
+      },
+    ],
+  })
+}
+
+test('scrubAgedImages replaces images on aged messages and keeps recent ones', () => {
+  const messages = [
+    userWithImage('a', 'AAAA'.repeat(100)),
+    userWithImage('b', 'BBBB'.repeat(100)),
+    userWithImage('c', 'CCCC'.repeat(100)),
+  ]
+  const { messages: out, replacedCount, replacedBytes } = scrubAgedImages(messages, 1)
+  expect(replacedCount).toBe(2)
+  expect(replacedBytes).toBeGreaterThan(0)
+  // Last (recent) message preserved as-is
+  expect(out[2]).toBe(messages[2])
+  // Earlier messages had their image block (nested inside the tool_result
+  // content array) replaced with a text placeholder. The outer tool_result
+  // wrapper is preserved.
+  const firstBlock = (out[0]!.message.content as Array<{ type: string; content?: unknown }>)[0]!
+  expect(firstBlock.type).toBe('tool_result')
+  const nested = (firstBlock.content as Array<{ type: string; text?: string }>)[0]!
+  expect(nested.type).toBe('text')
+  expect(nested.text).toContain('aged-image')
+})
+
+test('scrubAgedImages is a no-op when nothing is old enough', () => {
+  const messages = [userWithImage('a', 'AAAA'.repeat(100))]
+  const result = scrubAgedImages(messages, 5)
+  expect(result.replacedCount).toBe(0)
+  expect(result.messages).toBe(messages)
+})
+
+test('scrubAgedImages handles top-level image content blocks (vision uploads)', () => {
+  const userImg = createUserMessage({
+    content: [
+      {
+        type: 'image' as const,
+        source: { type: 'base64', media_type: 'image/png', data: 'ZZZZ'.repeat(50) },
+      },
+    ],
+  })
+  const recent = createUserMessage({ content: 'recent' })
+  const { messages: out, replacedCount } = scrubAgedImages([userImg, recent], 0)
+  expect(replacedCount).toBe(1)
+  const block = (out[0]!.message.content as Array<{ type: string; text?: string }>)[0]!
+  expect(block.type).toBe('text')
 })

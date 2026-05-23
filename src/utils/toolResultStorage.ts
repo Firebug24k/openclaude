@@ -895,6 +895,126 @@ export function scrubAgedToolResultContent(
 
 
 /**
+ * fix546.6: Aggressive aged-image scrubber. Distinct from
+ * scrubAgedToolResultContent, which only touches images >= minSizeBytes
+ * inside tool_result content arrays. This pass:
+ *   - replaces ALL image content blocks (any size) on aged user messages
+ *   - replaces images regardless of whether they're inside a tool_result
+ *     wrapper or as top-level user content blocks (vision uploads, etc.)
+ *
+ * Rationale (post-fix546.5 OOM 2026-05-22): screenshot/Read-image-heavy
+ * sessions (aictl) accumulate base64 image strings in REPL React state.
+ * Each can be 50–500 KB; once the model has consumed them they are pure
+ * heap dead-weight. The on-disk JSONL transcript retains originals.
+ *
+ * `keepRecentImages` controls how many of the most-recent image-bearing
+ * user messages are left untouched. Older image blocks become text
+ * placeholders.
+ */
+export function scrubAgedImages(
+  messages: Message[],
+  keepRecentImages: number,
+): { messages: Message[]; replacedCount: number; replacedBytes: number } {
+  if (keepRecentImages < 0 || messages.length === 0) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  // Cheap presence check: does a content array contain any image block,
+  // either as a top-level user image, or inside a tool_result's content
+  // array? Walk shallowly — we only need to know "is there one".
+  const hasImage = (m: Message): boolean => {
+    if (m?.type !== 'user') return false
+    const content = Array.isArray(m.message?.content) ? m.message.content : null
+    if (!content) return false
+    for (const b of content) {
+      const block = b as { type?: string; content?: unknown; source?: unknown }
+      if (block?.type === 'image') return true
+      if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+        for (const part of block.content) {
+          const p = part as { type?: string }
+          if (p?.type === 'image') return true
+        }
+      }
+    }
+    return false
+  }
+
+  // Find the cutoff: the index of the keepRecentImages-th image-bearing
+  // user message counting from the end. All image-bearing messages strictly
+  // before this index get scrubbed.
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!hasImage(messages[i] as Message)) continue
+    if (kept < keepRecentImages) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  const PLACEHOLDER =
+    '[image removed by aged-image scrubber to control heap]'
+  let replacedCount = 0
+  let replacedBytes = 0
+
+  const imageBytes = (src: unknown): number => {
+    const s = src as { data?: string } | null
+    if (s && typeof s.data === 'string') return s.data.length
+    return 256 // small fallback for non-base64 sources
+  }
+
+  const out = messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (m?.type !== 'user') return m
+    const content = Array.isArray(m.message?.content) ? m.message.content : null
+    if (!content) return m
+    let touched = false
+    const newContent = content.map(b => {
+      const block = b as {
+        type?: string
+        content?: unknown
+        source?: unknown
+      }
+      if (block?.type === 'image') {
+        replacedCount++
+        replacedBytes += imageBytes(block.source)
+        touched = true
+        return { type: 'text', text: PLACEHOLDER }
+      }
+      if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+        let arrTouched = false
+        const newArr = block.content.map(part => {
+          const p = part as { type?: string; source?: unknown }
+          if (p?.type === 'image') {
+            replacedCount++
+            replacedBytes += imageBytes(p.source)
+            arrTouched = true
+            return { type: 'text', text: PLACEHOLDER }
+          }
+          return part
+        })
+        if (arrTouched) {
+          touched = true
+          return { ...block, content: newArr }
+        }
+        return b
+      }
+      return b
+    })
+    return touched
+      ? { ...m, message: { ...m.message, content: newContent } }
+      : m
+  })
+
+  return { messages: out, replacedCount, replacedBytes }
+}
+
+/**
  * Rough byte cost of a `toolUseResult` payload. We don't need exactness —
  * just a relative signal of which retained payloads dominate memory.
  * Uses JSON.stringify length where possible, falling back to a constant
