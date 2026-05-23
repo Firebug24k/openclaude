@@ -1307,7 +1307,21 @@ export function setAllowedSettingSources(sources: SettingSource[]): void {
 
 export function preferThirdPartyAuthentication(): boolean {
   // IDE extension should behave as 1P for authentication reasons.
-  return getIsNonInteractiveSession() && STATE.clientType !== 'claude-vscode'
+  // Also prefer 3P auth when ANTHROPIC_BASE_URL points to a non-Anthropic
+  // host (e.g. cliproxy), so ANTHROPIC_API_KEY is honored in interactive mode.
+  if (getIsNonInteractiveSession() && STATE.clientType !== 'claude-vscode') {
+    return true
+  }
+  const baseUrl = process.env.ANTHROPIC_BASE_URL
+  if (baseUrl) {
+    try {
+      const host = new URL(baseUrl).host
+      if (!['api.anthropic.com', 'api-staging.anthropic.com'].includes(host)) {
+        return true
+      }
+    } catch {}
+  }
+  return false
 }
 
 export function setInlinePlugins(plugins: Array<string>): void {
