@@ -180,7 +180,7 @@ import { deserializeMessages } from '../utils/conversationRecovery.js';
 import { extractReadFilesFromMessages, extractBashToolsFromMessages } from '../utils/queryHelpers.js';
 import { resetMicrocompactState } from '../services/compact/microCompact.js';
 import { runPostCompactCleanup } from '../services/compact/postCompactCleanup.js';
-import { applyToolResultReplacementsToMessages, provisionContentReplacementState, reconstructContentReplacementState, scrubAgedImages, type ContentReplacementRecord } from '../utils/toolResultStorage.js';
+import { applyToolResultReplacementsToMessages, provisionContentReplacementState, reconstructContentReplacementState, scrubAgedImages, scrubAgedHookAttachments, type ContentReplacementRecord } from '../utils/toolResultStorage.js';
 import { emitProbe } from '../utils/memDebug.js';
 import { partialCompactConversation } from '../services/compact/compact.js';
 import type { LogOption } from '../types/logs.js';
@@ -2699,7 +2699,10 @@ export function REPL({
               }),
               newMessage
             ];
-            return scrubAgedImages(kept, 25).messages;
+            // fix546.6 + fix546.7: drop aged image base64 AND aged async hook
+            // attachment payloads from retained post-compact scrollback.
+            const imgScrubbed = scrubAgedImages(kept, 25).messages;
+            return scrubAgedHookAttachments(imgScrubbed, 25).messages;
           });
         } else {
           setMessages(() => [newMessage]);

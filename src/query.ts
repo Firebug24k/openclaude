@@ -103,6 +103,7 @@ import {
   scrubAgedToolUseResults,
   scrubAgedToolResultContent,
   scrubAgedImages,
+  scrubAgedHookAttachments,
   trimContentReplacementState,
 } from './utils/toolResultStorage.js'
 import {
@@ -480,6 +481,18 @@ async function* queryLoop(
     )
     messagesForQuery = imageScrub.messages
 
+    // fix546.7: aged async-hook-attachment scrubber — clears stdout/stderr/
+    // response payloads on aged `async_hook_response` AttachmentMessages.
+    // With matcher `.*` on PreToolUse, tool-heavy turns accumulate one
+    // attachment per tool call. Display is already suppressed in non-verbose
+    // mode but the data lived forever in REPL React state. Audit fields
+    // (hookName/hookEvent/toolName/exitCode/processId) are preserved.
+    const hookScrub = scrubAgedHookAttachments(
+      messagesForQuery,
+      keepRecentToolResults,
+    )
+    messagesForQuery = hookScrub.messages
+
     // fix546.6: mirror scrubbed messages back to the REPL React state.
     // Without this, scrubAgedToolResultContent + scrubAgedImages only
     // affect the engine-side `messagesForQuery` copy — `messagesRef.current`
@@ -489,7 +502,9 @@ async function* queryLoop(
     // (covers post-compact removals).
     if (
       toolUseContext.syncScrubbedMessages &&
-      (contentScrub.replacedCount > 0 || imageScrub.replacedCount > 0)
+      (contentScrub.replacedCount > 0 ||
+        imageScrub.replacedCount > 0 ||
+        hookScrub.replacedCount > 0)
     ) {
       toolUseContext.syncScrubbedMessages(messagesForQuery)
     }

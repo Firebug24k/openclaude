@@ -1015,6 +1015,109 @@ export function scrubAgedImages(
 }
 
 /**
+ * fix546.7: Aged async-hook-attachment scrubber.
+ *
+ * Each async hook completion creates an `async_hook_response` AttachmentMessage
+ * (see src/utils/attachments.ts:341-351 + 3511-3520). The wrapper is retained
+ * in REPL React state (`messagesRef.current`) — the same retainer the
+ * post-fix546.5 OOM post-mortem identified. With matcher `.*` on PreToolUse,
+ * tool-heavy turns (aictl 100+ tool calls/turn) accumulate hundreds of these
+ * per user turn. The display is suppressed in non-verbose mode but the data
+ * is retained.
+ *
+ * This scrubber clears the heavy payload fields (`stdout`, `stderr`,
+ * `response`) on aged attachments, while preserving audit fields
+ * (`hookName`, `hookEvent`, `toolName`, `exitCode`, `processId`, `type`).
+ *
+ * Mirrors `scrubAgedImages` for caller symmetry: `keepRecent` is the count
+ * of the most-recent async_hook_response attachment-bearing messages left
+ * untouched.
+ */
+export function scrubAgedHookAttachments(
+  messages: Message[],
+  keepRecent: number,
+): { messages: Message[]; replacedCount: number; replacedBytes: number } {
+  if (keepRecent < 0 || messages.length === 0) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  const isAgedHookAttachment = (m: Message): boolean => {
+    if (m?.type !== 'attachment') return false
+    const att = m.attachment as { type?: string } | undefined
+    return att?.type === 'async_hook_response'
+  }
+
+  // Find the cutoff: the index of the keepRecent-th hook-attachment message
+  // counting from the end. All such messages strictly before this index get
+  // scrubbed.
+  let kept = 0
+  let firstScrubIndex = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!isAgedHookAttachment(messages[i] as Message)) continue
+    if (kept < keepRecent) {
+      kept++
+      continue
+    }
+    firstScrubIndex = i
+    break
+  }
+  if (firstScrubIndex === -1) {
+    return { messages, replacedCount: 0, replacedBytes: 0 }
+  }
+
+  let replacedCount = 0
+  let replacedBytes = 0
+
+  const fieldBytes = (v: unknown): number => {
+    if (typeof v === 'string') return v.length
+    if (v === undefined || v === null) return 0
+    try {
+      return JSON.stringify(v).length
+    } catch {
+      return 256
+    }
+  }
+
+  const out = messages.map((m, i) => {
+    if (i > firstScrubIndex) return m
+    if (!isAgedHookAttachment(m as Message)) return m
+    const att = (m as { attachment: unknown }).attachment as {
+      type?: string
+      stdout?: string
+      stderr?: string
+      response?: unknown
+    }
+    const stdout = att.stdout ?? ''
+    const stderr = att.stderr ?? ''
+    const response = att.response
+    // Skip if already scrubbed (nothing heavy to drop).
+    if (
+      stdout === '' &&
+      stderr === '' &&
+      (response === undefined ||
+        (response &&
+          typeof response === 'object' &&
+          Object.keys(response as object).length === 0))
+    ) {
+      return m
+    }
+    replacedBytes += fieldBytes(stdout) + fieldBytes(stderr) + fieldBytes(response)
+    replacedCount++
+    return {
+      ...(m as object),
+      attachment: {
+        ...att,
+        stdout: '',
+        stderr: '',
+        response: {},
+      },
+    }
+  })
+
+  return { messages: out, replacedCount, replacedBytes }
+}
+
+/**
  * Rough byte cost of a `toolUseResult` payload. We don't need exactness —
  * just a relative signal of which retained payloads dominate memory.
  * Uses JSON.stringify length where possible, falling back to a constant

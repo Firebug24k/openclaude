@@ -6,6 +6,7 @@ import {
   createContentReplacementState,
   measureContentReplacementState,
   measureToolUseResultRetention,
+  scrubAgedHookAttachments,
   scrubAgedImages,
   scrubAgedToolUseResults,
   trimContentReplacementState,
@@ -272,4 +273,71 @@ test('scrubAgedImages handles top-level image content blocks (vision uploads)', 
   expect(replacedCount).toBe(1)
   const block = (out[0]!.message.content as Array<{ type: string; text?: string }>)[0]!
   expect(block.type).toBe('text')
+})
+
+// fix546.7: scrubAgedHookAttachments smoke tests.
+
+function hookAttachmentMsg(processId: string, stdout: string, stderr = '') {
+  return {
+    type: 'attachment',
+    uuid: `uuid-${processId}`,
+    timestamp: new Date().toISOString(),
+    attachment: {
+      type: 'async_hook_response',
+      processId,
+      hookName: 'PreToolUse',
+      hookEvent: 'PreToolUse',
+      toolName: 'Bash',
+      response: { systemMessage: 'noisy details ' + stdout },
+      stdout,
+      stderr,
+      exitCode: 0,
+    },
+  }
+}
+
+test('scrubAgedHookAttachments clears stdout/stderr/response on aged async_hook_response attachments', () => {
+  const messages = [
+    hookAttachmentMsg('a', 'AAAA'.repeat(100), 'errA'),
+    hookAttachmentMsg('b', 'BBBB'.repeat(100), 'errB'),
+    hookAttachmentMsg('c', 'CCCC'.repeat(100)),
+  ]
+  const { messages: out, replacedCount, replacedBytes } = scrubAgedHookAttachments(messages, 1)
+  expect(replacedCount).toBe(2)
+  expect(replacedBytes).toBeGreaterThan(0)
+  // Last (recent) attachment preserved as-is
+  expect(out[2]).toBe(messages[2])
+  // Earlier attachments had heavy fields cleared
+  const first = (out[0] as { attachment: { stdout: string; stderr: string; response: object } }).attachment
+  expect(first.stdout).toBe('')
+  expect(first.stderr).toBe('')
+  expect(first.response).toEqual({})
+})
+
+test('scrubAgedHookAttachments preserves hookEvent + hookName + exitCode (audit fields)', () => {
+  const messages = [hookAttachmentMsg('a', 'AAAA'.repeat(100)), hookAttachmentMsg('b', '')]
+  const { messages: out } = scrubAgedHookAttachments(messages, 1)
+  const first = (out[0] as {
+    attachment: {
+      type: string
+      processId: string
+      hookName: string
+      hookEvent: string
+      toolName: string
+      exitCode: number
+    }
+  }).attachment
+  expect(first.type).toBe('async_hook_response')
+  expect(first.processId).toBe('a')
+  expect(first.hookName).toBe('PreToolUse')
+  expect(first.hookEvent).toBe('PreToolUse')
+  expect(first.toolName).toBe('Bash')
+  expect(first.exitCode).toBe(0)
+})
+
+test('scrubAgedHookAttachments leaves recent attachments untouched', () => {
+  const messages = [hookAttachmentMsg('a', 'AAAA'.repeat(100))]
+  const result = scrubAgedHookAttachments(messages, 5)
+  expect(result.replacedCount).toBe(0)
+  expect(result.messages).toBe(messages)
 })
